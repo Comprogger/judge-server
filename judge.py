@@ -16,7 +16,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask import send_file
 from flask import send_from_directory
-from flask_socketio import SocketIO
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})

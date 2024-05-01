@@ -22,4 +22,4 @@ WORKDIR /app
 RUN pip install -r requirements.txt
 
 # Command to run the Flask application
-CMD [ "python", "judge.py" ]
+CMD [ "python", "-u", "judge.py" ]

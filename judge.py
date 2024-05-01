@@ -19,7 +19,7 @@ from flask import send_from_directory
 from flask_socketio import SocketIO
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
+CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
 cred = credentials.Certificate('serviceAccountKey.json')
 firebase_admin.initialize_app(cred)
 db = firestore.client()
@@ -193,6 +193,9 @@ def get_result_file(filename):
 def execute():
     try:
         data = request.get_json()
+
+        print("wasg")
+
         language = data.get('language', 'python')
         code = data.get('code', '')
         test_cases = data.get('test_cases', [])

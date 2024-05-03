@@ -12,10 +12,13 @@ import subprocess
 import firebase_admin
 from firebase_admin import credentials, firestore
 from io import StringIO
+import multiprocessing
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask import send_file
 from flask import send_from_directory
+from flask_socketio import SocketIO
+import signal
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
@@ -24,22 +27,6 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 TIME_LIMIT = 2
-
-class TimeoutException(Exception): pass
-
-def handler(signum, frame):
-    raise TimeoutException()
-
-def execute_with_time_limit(func, args):
-    signal.alarm(TIME_LIMIT)
-    try:
-        res = func(*args)
-        signal.alarm(0)
-        return res
-    except TimeoutException:
-        return 'Time limit exceeded'
-    except Exception as e:
-        return str(e)
 
 def execute_code(code, test_cases, language):
     results = []
@@ -55,15 +42,31 @@ def execute_code(code, test_cases, language):
         input_data = str(test_case['input'])
         expected_output = str(test_case['output']).replace('\r', '')
 
+        def run_test_case(input_data, compiled_code, language, result_queue):
+            try:
+                if language == 'python':
+                    result = execute_python_code(compiled_code, input_data)
+                elif language == 'java':
+                    result = execute_java_code(compiled_code, input_data)
+                elif language == 'cpp':
+                    result = execute_cpp_code(compiled_code, input_data)
+                else:
+                    result = 'Unsupported lang ' + language
+            except Exception as e:
+                result = str(e)
+            result_queue.put(result)
+
+        result_queue = multiprocessing.Queue()
+        process = multiprocessing.Process(target=run_test_case, args=(input_data, compiled_code, language, result_queue))
         start_time = time.time()
-        if language == 'python':
-            result = execute_with_time_limit(execute_python_code, (compiled_code, input_data))
-        elif language == 'java':
-            result = execute_with_time_limit(execute_java_code, (compiled_code, input_data))
-        elif language == 'cpp':
-            result = execute_with_time_limit(execute_cpp_code, (compiled_code, input_data))
+        process.start()
+        process.join(timeout=1)  # Set a timeout of 1 second for process execution
+        if process.is_alive():
+            process.terminate()  # Terminate the process if it exceeds 1 second
+            result = 'Time limit exceeded'
         else:
-            result = 'Unsupported lang ' + language
+            result = result_queue.get()
+
         execution_time = time.time() - start_time
 
         result = result.replace('\r', '')
@@ -71,10 +74,11 @@ def execute_code(code, test_cases, language):
         status = {'description': 'Accepted', 'id': 1} if result.strip() == expected_output.strip() else {'description': 'Wrong Answer', 'id': 2}
         if result == 'Time limit exceeded':
             status = {'description': 'Time Limit Exceeded', 'id': 4}
-        elif execution_time > TIME_LIMIT:
-            status = {'description': 'Time Limit Exceeded', 'id': 4}
-
-        results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})
+            # If time limit exceeded, set remaining test cases to "Nothing" and "Wrong Answer"
+            results.append({'key': key, 'status': status, 'stdout': 'Nothing', 'time': 0})
+            break  # Exit loop for remaining test cases
+        else:
+            results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})
 
     return results
 
@@ -219,11 +223,6 @@ def get_results(request_id):
         return jsonify(results)
     except FileNotFoundError:
         return jsonify({'error': 'Results not found'}), 404
-
-
-
-
-
 
 
 if __name__ == '__main__':

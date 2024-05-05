@@ -31,7 +31,7 @@ TIME_LIMIT = 2
 def execute_code(code, test_cases, language):
     results = []
     compiled_code = None
-
+    tle = False
     if language == 'python':
         compiled_code = compile(code, '<string>', 'exec')
     elif language in ['java', 'cpp']:
@@ -41,7 +41,9 @@ def execute_code(code, test_cases, language):
         key = test_case['key']
         input_data = str(test_case['input'])
         expected_output = str(test_case['output']).replace('\r', '')
-
+        if (tle == True):
+            results.append({'key': key, 'status': {'description': 'Wrong Answer', 'id': 2}, 'stdout': 'Nothing', 'time': 0})
+            continue
         def run_test_case(input_data, compiled_code, language, result_queue):
             try:
                 if language == 'python':
@@ -76,7 +78,7 @@ def execute_code(code, test_cases, language):
             status = {'description': 'Time Limit Exceeded', 'id': 4}
             # If time limit exceeded, set remaining test cases to "Nothing" and "Wrong Answer"
             results.append({'key': key, 'status': status, 'stdout': 'Nothing', 'time': 0})
-            break  # Exit loop for remaining test cases
+            tle = True  # Exit loop for remaining test cases
         else:
             results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})
 
@@ -173,7 +175,7 @@ def process_queue():
                 # Add "stop" to the results array
                 results.append({'key': 'stop', 'status': {'description': 'Processing complete', 'id': 5}, 'stdout': '', 'time': 0})
 
-                # Update Firestore document with results
+                # Update Firestore document with results 
                 request_id = file[:-4]  # Get the request ID from the file name
                 doc_ref = db.collection('Results').document(request_id)
                 doc_ref.set({'results': results})
@@ -223,6 +225,11 @@ def get_results(request_id):
         return jsonify(results)
     except FileNotFoundError:
         return jsonify({'error': 'Results not found'}), 404
+
+
+
+
+
 
 
 if __name__ == '__main__':

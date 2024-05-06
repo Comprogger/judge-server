@@ -4,7 +4,7 @@ FROM python:3.9-buster
 RUN apt-get update && apt-get install -y gcc g++ openjdk-11-jdk
 
 # Install Firebase Admin SDK and Flask-CORS
-RUN pip install firebase-admin Flask-CORS
+RUN pip install firebase-admin Flask-CORS psutil
 
 # Copy the requirements and judge.py files
 COPY requirements.txt /app/

@@ -1,3 +1,4 @@
+
 import sys
 import io
 import tempfile
@@ -12,6 +13,7 @@ import subprocess
 import firebase_admin
 from firebase_admin import credentials, firestore
 from io import StringIO
+import psutil
 import multiprocessing
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -27,8 +29,55 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 TIME_LIMIT = 2
+DEFAULT_MEMORY_LIMIT_MB = 256
+import resource
 
-def execute_code(code, test_cases, language):
+def run_test_case(input_data, compiled_code, language, result_queue, memory_limit):
+    try:
+        process_memory_limit = memory_limit * 1024 * 1024  # Convert MB to bytes
+
+        if language == 'python':
+            process = subprocess.Popen(['python'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        elif language == 'java':
+            temp_dir, class_name = compiled_code
+            process = subprocess.Popen(['java', '-classpath', temp_dir, class_name], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        elif language == 'cpp':
+            process = subprocess.Popen([compiled_code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        process.stdin.write(input_data.encode())
+        process.stdin.flush()
+        
+        start_time = time.time()
+        while process.poll() is None:
+            # Check memory usage of the process
+            max_memory_usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss  # Get maximum resident set size
+            if max_memory_usage > process_memory_limit:
+                process.terminate()
+                result_queue.put('Memory limit exceeded')
+                return
+
+            # Check if the process exceeds the time limit
+            if time.time() - start_time > TIME_LIMIT:
+                process.terminate()
+                result_queue.put('Time limit exceeded')
+                return
+            
+            time.sleep(0.1)  # Check every 0.1 second
+
+        stdout, stderr = process.communicate()
+        result = stdout.decode().strip()
+
+        # Check if the process returned any output
+        if not result:
+            result = stderr.decode().strip()  # Use stderr if stdout is empty
+
+        result_queue.put(result)
+    except Exception as e:
+        result_queue.put(str(e))
+
+        
+def execute_code(code, test_cases, language, memory_limit=None):
+    memory_limit = memory_limit or DEFAULT_MEMORY_LIMIT_MB
     results = []
     compiled_code = None
     tle = False
@@ -44,22 +93,8 @@ def execute_code(code, test_cases, language):
         if (tle == True):
             results.append({'key': key, 'status': {'description': 'Wrong Answer', 'id': 2}, 'stdout': 'Nothing', 'time': 0})
             continue
-        def run_test_case(input_data, compiled_code, language, result_queue):
-            try:
-                if language == 'python':
-                    result = execute_python_code(compiled_code, input_data)
-                elif language == 'java':
-                    result = execute_java_code(compiled_code, input_data)
-                elif language == 'cpp':
-                    result = execute_cpp_code(compiled_code, input_data)
-                else:
-                    result = 'Unsupported lang ' + language
-            except Exception as e:
-                result = str(e)
-            result_queue.put(result)
-
         result_queue = multiprocessing.Queue()
-        process = multiprocessing.Process(target=run_test_case, args=(input_data, compiled_code, language, result_queue))
+        process = multiprocessing.Process(target=run_test_case, args=(input_data, compiled_code, language, result_queue, memory_limit))
         start_time = time.time()
         process.start()
         process.join(timeout=1)  # Set a timeout of 1 second for process execution
@@ -79,6 +114,11 @@ def execute_code(code, test_cases, language):
             # If time limit exceeded, set remaining test cases to "Nothing" and "Wrong Answer"
             results.append({'key': key, 'status': status, 'stdout': 'Nothing', 'time': 0})
             tle = True  # Exit loop for remaining test cases
+        elif result == 'Memory limit exceeded':
+            status = {'description': 'Memory Limit Exceeded', 'id': 6}
+            # If memory limit exceeded, set remaining test cases to "Nothing" and "Wrong Answer"
+            results.append({'key': key, 'status': status, 'stdout': 'Nothing', 'time': 0})
+            break  # Exit loop for remaining test cases
         else:
             results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})
 
@@ -169,8 +209,10 @@ def process_queue():
                 language = data['language']
                 code = data['code']
                 test_cases = data['test_cases']
+                memory_limit = data.get('memory_limit', DEFAULT_MEMORY_LIMIT_MB)  # Use default if not provided
                 # Process the request
-                results = execute_code(code, test_cases, language)
+                results = execute_code(code, test_cases, language, memory_limit=memory_limit)
+
 
                 # Add "stop" to the results array
                 results.append({'key': 'stop', 'status': {'description': 'Processing complete', 'id': 5}, 'stdout': '', 'time': 0})
@@ -195,22 +237,23 @@ def get_result_file(filename):
 
 # Modify the /execute route to return the request ID
 @app.route('/execute', methods=['POST'])
+# Modify the /execute route to accept memory_limit parameter
+@app.route('/execute', methods=['POST'])
 def execute():
     try:
         data = request.get_json()
 
-        print("wasg")
-
         language = data.get('language', 'python')
         code = data.get('code', '')
         test_cases = data.get('test_cases', [])
+        memory_limit = data.get('memory_limit', DEFAULT_MEMORY_LIMIT_MB)  # Use default if not provided
 
         # Generate a unique request ID
         request_id = str(uuid.uuid4())
-        print("rid", request_id)
+
         # Write the request to a new file in the queue
         with open(os.path.join('queue', f'{request_id}.txt'), 'w') as f:
-            json.dump({'language': language, 'code': code, 'test_cases': test_cases}, f)
+            json.dump({'language': language, 'code': code, 'test_cases': test_cases, 'memory_limit': memory_limit}, f)
 
         return jsonify({'request_id': request_id})
     except Exception as e:

@@ -1,4 +1,3 @@
-
 import sys
 import io
 import tempfile
@@ -30,8 +29,6 @@ db = firestore.client()
 
 TIME_LIMIT = 2
 DEFAULT_MEMORY_LIMIT_MB = 256
-import resource
-
 def run_test_case(input_data, compiled_code, language, result_queue, memory_limit):
     try:
         process_memory_limit = memory_limit * 1024 * 1024  # Convert MB to bytes
@@ -50,8 +47,7 @@ def run_test_case(input_data, compiled_code, language, result_queue, memory_limi
         start_time = time.time()
         while process.poll() is None:
             # Check memory usage of the process
-            max_memory_usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss  # Get maximum resident set size
-            if max_memory_usage > process_memory_limit:
+            if psutil.Process(process.pid).memory_info().rss > process_memory_limit:
                 process.terminate()
                 result_queue.put('Memory limit exceeded')
                 return
@@ -65,16 +61,9 @@ def run_test_case(input_data, compiled_code, language, result_queue, memory_limi
             time.sleep(0.1)  # Check every 0.1 second
 
         stdout, stderr = process.communicate()
-        result = stdout.decode().strip()
-
-        # Check if the process returned any output
-        if not result:
-            result = stderr.decode().strip()  # Use stderr if stdout is empty
-
-        result_queue.put(result)
+        result_queue.put(stdout.decode())
     except Exception as e:
         result_queue.put(str(e))
-
         
 def execute_code(code, test_cases, language, memory_limit=None):
     memory_limit = memory_limit or DEFAULT_MEMORY_LIMIT_MB
@@ -118,6 +107,7 @@ def execute_code(code, test_cases, language, memory_limit=None):
             status = {'description': 'Memory Limit Exceeded', 'id': 6}
             # If memory limit exceeded, set remaining test cases to "Nothing" and "Wrong Answer"
             results.append({'key': key, 'status': status, 'stdout': 'Nothing', 'time': 0})
+            tle = True  # Exit loop for remaining test cases
             break  # Exit loop for remaining test cases
         else:
             results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})

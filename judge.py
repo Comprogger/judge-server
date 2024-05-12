@@ -18,8 +18,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask import send_file
 from flask import send_from_directory
-from flask_socketio import SocketIO
 import signal
+import docker
+from docker.errors import DockerException
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
@@ -75,6 +76,42 @@ def execute_code(code, test_cases, language, memory_limit=None):
     elif language in ['java', 'cpp']:
         compiled_code = compile_code(code, language)
 
+    print("Creating docker client...")
+
+    # Create a Docker client
+    try:
+        client = docker.DockerClient(base_url='unix:///var/run/docker.sock')
+    except DockerException as e:
+        print(f"Failed to create Docker client: {e}")
+        return
+        
+    # Create a Dockerfile for each code submission
+    dockerfile = f'''
+FROM python:3.9-buster
+RUN apt-get update && apt-get install -y gcc g++ openjdk-11-jdk
+RUN pip install firebase-admin Flask-CORS psutil
+WORKDIR /app
+COPY . /app
+CMD [ "python", "-u", "worker.py" ]
+'''
+
+    print("Building docker image...")
+
+    # Build a new Docker image for each code submission
+    image, build_logs = client.images.build(fileobj=io.BytesIO(dockerfile.encode('utf-8')), rm=True, tag='worker')
+
+    print("Docker image built")
+
+    # Create a new Docker container for each code submission
+    container = client.containers.run(
+        'worker',  # Replace with your Docker image name
+        detach=True,
+        auto_remove=True,
+        mem_limit=f'{memory_limit}m',
+        stdin_open=True,
+        tty=True
+    )
+
     for test_case in test_cases:
         key = test_case['key']
         input_data = str(test_case['input'])
@@ -82,9 +119,12 @@ def execute_code(code, test_cases, language, memory_limit=None):
         if (tle == True):
             results.append({'key': key, 'status': {'description': 'Wrong Answer', 'id': 2}, 'stdout': 'Nothing', 'time': 0})
             continue
+        
+        start_time = time.time()
+        
+        '''
         result_queue = multiprocessing.Queue()
         process = multiprocessing.Process(target=run_test_case, args=(input_data, compiled_code, language, result_queue, memory_limit))
-        start_time = time.time()
         process.start()
         process.join(timeout=1)  # Set a timeout of 1 second for process execution
         if process.is_alive():
@@ -92,6 +132,10 @@ def execute_code(code, test_cases, language, memory_limit=None):
             result = 'Time limit exceeded'
         else:
             result = result_queue.get()
+        '''
+
+        # Run the test case in the Docker container
+        result = container.exec_run(f'python test_case_runner.py {input_data} {compiled_code} {language} {memory_limit}', stdout=True, stderr=True)
 
         execution_time = time.time() - start_time
 

@@ -20,7 +20,6 @@ from flask import send_file
 from flask import send_from_directory
 import signal
 import docker
-from docker.errors import DockerException
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
@@ -30,42 +29,28 @@ db = firestore.client()
 
 TIME_LIMIT = 2
 DEFAULT_MEMORY_LIMIT_MB = 256
-def run_test_case(input_data, compiled_code, language, result_queue, memory_limit):
+
+def run_test_case(input_data, compiled_code, language, result_queue, memory_limit, container, command, time_limit=TIME_LIMIT):
     try:
-        process_memory_limit = memory_limit * 1024 * 1024  # Convert MB to bytes
+        # Convert memory limit from MB to KB
+        memory_limit_kb = memory_limit * 1024
 
-        if language == 'python':
-            process = subprocess.Popen(['python'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        elif language == 'java':
-            temp_dir, class_name = compiled_code
-            process = subprocess.Popen(['java', '-classpath', temp_dir, class_name], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        elif language == 'cpp':
-            process = subprocess.Popen([compiled_code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        process.stdin.write(input_data.encode())
-        process.stdin.flush()
-        
-        start_time = time.time()
-        while process.poll() is None:
-            # Check memory usage of the process
-            if psutil.Process(process.pid).memory_info().rss > process_memory_limit:
-                process.terminate()
-                result_queue.put('Memory limit exceeded')
-                return
+        # Run the compiled code inside the Docker container against stdin of input_data
+        print("Running the compiled code inside the Docker container...")
+        exec_id = container.exec_run(f'/bin/bash -c "ulimit -v {memory_limit_kb}; echo \\"{input_data}\\" | timeout --foreground {time_limit} {command}; echo \\"Exit Status: $?\\""', stdout=True, stderr=True)
+        output = exec_id.output.decode('utf-8')
+        print(output)
 
-            # Check if the process exceeds the time limit
-            if time.time() - start_time > TIME_LIMIT:
-                process.terminate()
-                result_queue.put('Time limit exceeded')
-                return
-            
-            time.sleep(0.1)  # Check every 0.1 second
-
-        stdout, stderr = process.communicate()
-        result_queue.put(stdout.decode())
+        if 'Exit Status: 124' in output:
+            result_queue.put('Time limit exceeded')
+        elif 'Exit Status: 134' in output:
+            result_queue.put('Memory limit exceeded')
+        else:
+            result_queue.put(output)
     except Exception as e:
+        print(str(e))
         result_queue.put(str(e))
-        
+
 def execute_code(code, test_cases, language, memory_limit=None):
     memory_limit = memory_limit or DEFAULT_MEMORY_LIMIT_MB
     results = []
@@ -77,40 +62,37 @@ def execute_code(code, test_cases, language, memory_limit=None):
         compiled_code = compile_code(code, language)
 
     print("Creating docker client...")
+    client = docker.DockerClient(base_url='unix://var/run/docker.sock')
+    print("Client created")
 
-    # Create a Docker client
-    try:
-        client = docker.DockerClient(base_url='unix:///var/run/docker.sock')
-    except DockerException as e:
-        print(f"Failed to create Docker client: {e}")
-        return
-        
-    # Create a Dockerfile for each code submission
-    dockerfile = f'''
-FROM python:3.9-buster
-RUN apt-get update && apt-get install -y gcc g++ openjdk-11-jdk
-RUN pip install firebase-admin Flask-CORS psutil
-WORKDIR /app
-COPY . /app
-CMD [ "python", "-u", "worker.py" ]
-'''
+    # Build Docker image from Dockerfile in /app/worker
+    print("Building Docker image...")
+    client.images.build(path='/app/worker', tag='worker_image')
 
-    print("Building docker image...")
+    if language == 'python':
+        image = 'python:3.8'
+        command = 'python'
+    elif language == 'java':
+        image = 'openjdk:11'
+        temp_dir, class_name = compiled_code
+        command = f'java -classpath {temp_dir} {class_name}'
+    elif language == 'cpp':
+        image = 'worker_image'  # Use the built image
+        command = f'{compiled_code}'
 
-    # Build a new Docker image for each code submission
-    image, build_logs = client.images.build(fileobj=io.BytesIO(dockerfile.encode('utf-8')), rm=True, tag='worker')
-
-    print("Docker image built")
-
-    # Create a new Docker container for each code submission
-    container = client.containers.run(
-        'worker',  # Replace with your Docker image name
-        detach=True,
-        auto_remove=True,
-        mem_limit=f'{memory_limit}m',
+    # Create Docker container
+    print("Creating Docker container...")
+    container = client.containers.create(
+        image=image,
+        command='/bin/sh',
         stdin_open=True,
+        detach=True,
         tty=True
     )
+
+    # Start the Docker container
+    print("Starting Docker container...")
+    container.start()
 
     for test_case in test_cases:
         key = test_case['key']
@@ -119,24 +101,13 @@ CMD [ "python", "-u", "worker.py" ]
         if (tle == True):
             results.append({'key': key, 'status': {'description': 'Wrong Answer', 'id': 2}, 'stdout': 'Nothing', 'time': 0})
             continue
-        
-        start_time = time.time()
-        
-        '''
         result_queue = multiprocessing.Queue()
-        process = multiprocessing.Process(target=run_test_case, args=(input_data, compiled_code, language, result_queue, memory_limit))
+        process = multiprocessing.Process(target=run_test_case, args=(input_data, compiled_code, language, result_queue, memory_limit, container, command))
+        start_time = time.time()
         process.start()
-        process.join(timeout=1)  # Set a timeout of 1 second for process execution
-        if process.is_alive():
-            process.terminate()  # Terminate the process if it exceeds 1 second
-            result = 'Time limit exceeded'
-        else:
-            result = result_queue.get()
-        '''
 
-        # Run the test case in the Docker container
-        result = container.exec_run(f'python test_case_runner.py {input_data} {compiled_code} {language} {memory_limit}', stdout=True, stderr=True)
-
+        result = result_queue.get()
+            
         execution_time = time.time() - start_time
 
         result = result.replace('\r', '')
@@ -156,13 +127,20 @@ CMD [ "python", "-u", "worker.py" ]
         else:
             results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})
 
-    return results
+    print("Removing container...")
+    container.remove(force=True)
 
+    if language == 'cpp':
+        print("Deleting temporary C++ files...")
+        os.remove(compiled_code)
+        os.remove(f'{compiled_code}.cpp')
+
+    return results
 
 def compile_code(code, language):
     if language == 'java':
         class_name = re.search(r'class (\w+)', code).group(1)
-        with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
+        with tempfile.TemporaryDirectory(dir="/app/worker") as temp_dir:
             java_file_name = os.path.join(temp_dir, f"{class_name}.java")
             with open(java_file_name, 'w') as java_file:
                 java_file.write(code)
@@ -173,7 +151,7 @@ def compile_code(code, language):
                 return compile_result.stderr.decode()
             return temp_dir, class_name
     elif language == 'cpp':
-        with tempfile.NamedTemporaryFile(suffix=".cpp", dir="/tmp", delete=False) as cpp_file:
+        with tempfile.NamedTemporaryFile(suffix=".cpp", dir="/app/worker", delete=False) as cpp_file:
             cpp_file.write(code.encode())
             cpp_file_name = cpp_file.name
         compile_result = subprocess.run(
@@ -182,44 +160,9 @@ def compile_code(code, language):
         )
         if compile_result.returncode != 0:
             return compile_result.stderr.decode()
+        # Adjust perms to ensure Docker container can access it
+        os.chmod(cpp_file_name[:-4], 0o777)
         return cpp_file_name[:-4]
-
-def execute_python_code(compiled_code, input_data):
-    original_stdin = sys.stdin
-    sys.stdin = io.StringIO(input_data)
-    original_stdout = sys.stdout
-    sys.stdout = output_capture = io.StringIO()
-
-    try:
-        exec(compiled_code)
-        output = output_capture.getvalue()
-        return output
-    except Exception as e:
-        return str(e)
-    finally:
-        sys.stdin = original_stdin
-        sys.stdout = original_stdout
-
-def execute_java_code(compiled_code, input_data):
-    temp_dir, class_name = compiled_code
-    try:
-        run_result = subprocess.Popen(
-            ['java', '-classpath', temp_dir, class_name], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        output, _ = run_result.communicate(input=input_data.encode())
-        return output.decode()
-    except Exception as e:
-        return str(e)
-
-def execute_cpp_code(compiled_code, input_data):
-    try:
-        run_result = subprocess.Popen(
-            [compiled_code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        output, _ = run_result.communicate(input=input_data.encode())
-        return output.decode()
-    except Exception as e:
-        return str(e)
 
 @app.route('/get_data')
 def get_data(id):

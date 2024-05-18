@@ -30,14 +30,16 @@ db = firestore.client()
 TIME_LIMIT = 2
 DEFAULT_MEMORY_LIMIT_MB = 256
 
-def run_test_case(input_data, compiled_code, language, result_queue, memory_limit, container, command, time_limit=TIME_LIMIT):
+import os
+
+def run_test_case(input_file, compiled_code, language, result_queue, memory_limit, container, command, time_limit=TIME_LIMIT):
     try:
         # Convert memory limit from MB to KB
         memory_limit_kb = memory_limit * 1024
 
         # Run the compiled code inside the Docker container against stdin of input_data
         print("Running the compiled code inside the Docker container...")
-        exec_id = container.exec_run(f'/bin/bash -c "ulimit -v {memory_limit_kb}; echo \\"{input_data}\\" | timeout --foreground {time_limit} {command}; echo \\"Exit Status: $?\\""', stdout=True, stderr=True)
+        exec_id = container.exec_run(f'/bin/bash -c "ulimit -v {memory_limit_kb}; cat {input_file} | timeout --foreground {time_limit} /usr/bin/time -v {command}; echo \\"Exit Status: $?\\""', stdout=True, stderr=True)
         output = exec_id.output.decode('utf-8')
         print(output)
 
@@ -64,6 +66,17 @@ def execute_code(code, test_cases, language, memory_limit=None):
     print("Creating docker client...")
     client = docker.DockerClient(base_url='unix://var/run/docker.sock')
     print("Client created")
+
+    # Write all the input data to files in a folder
+    input_dir = "/app/worker/input_data"
+    os.makedirs(input_dir, exist_ok=True)
+    input_files = []
+    for i, test_case in enumerate(test_cases):
+        input_data = str(test_case['input'])
+        input_file = os.path.join(input_dir, f"input_{i}.txt")
+        with open(input_file, "w") as f:
+            f.write(input_data)
+        input_files.append(input_file)
 
     # Build Docker image from Dockerfile in /app/worker
     print("Building Docker image...")
@@ -94,15 +107,15 @@ def execute_code(code, test_cases, language, memory_limit=None):
     print("Starting Docker container...")
     container.start()
 
-    for test_case in test_cases:
+    for i, test_case in enumerate(test_cases):
         key = test_case['key']
-        input_data = str(test_case['input'])
+        input_file = input_files[i]
         expected_output = str(test_case['output']).replace('\r', '')
         if (tle == True):
             results.append({'key': key, 'status': {'description': 'Wrong Answer', 'id': 2}, 'stdout': 'Nothing', 'time': 0})
             continue
         result_queue = multiprocessing.Queue()
-        process = multiprocessing.Process(target=run_test_case, args=(input_data, compiled_code, language, result_queue, memory_limit, container, command))
+        process = multiprocessing.Process(target=run_test_case, args=(input_file, compiled_code, language, result_queue, memory_limit, container, command))
         start_time = time.time()
         process.start()
 
@@ -126,6 +139,8 @@ def execute_code(code, test_cases, language, memory_limit=None):
             break  # Exit loop for remaining test cases
         else:
             results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})
+
+        os.remove(input_file)
 
     print("Removing container...")
     container.remove(force=True)

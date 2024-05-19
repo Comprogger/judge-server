@@ -30,38 +30,67 @@ db = firestore.client()
 TIME_LIMIT = 2
 DEFAULT_MEMORY_LIMIT_MB = 256
 
-import os
-
 def run_test_case(input_file, compiled_code, language, result_queue, memory_limit, container, command, time_limit=TIME_LIMIT):
     try:
         # Convert memory limit from MB to KB
         memory_limit_kb = memory_limit * 1024
 
-        # Run the compiled code inside the Docker container against stdin of input_data
-        print("Running the compiled code inside the Docker container...")
-        exec_id = container.exec_run(f'/bin/bash -c "ulimit -v {memory_limit_kb}; cat {input_file} | timeout --foreground {time_limit} /usr/bin/time -v {command}; echo \\"Exit Status: $?\\""', stdout=True, stderr=True)
-        output = exec_id.output.decode('utf-8')
-        print(output)
+        # Define the commands to be run
+        if language == 'python':
+            command = f'python {command}'
+        elif language == 'java':
+            command = f'java {command}'
+        elif language == 'cpp':
+            command = command
 
-        if 'Exit Status: 124' in output:
-            result_queue.put('Time limit exceeded')
-        elif 'Exit Status: 134' in output:
-            result_queue.put('Memory limit exceeded')
+        combined_cmd = f'/bin/bash -c "ulimit -v {memory_limit_kb}; exec 3>&1 4>&2; TIMEFORMAT=\\"%3R\\"; time_result=$( (time (cat {input_file} | timeout --foreground {time_limit} {command} >\\&3) 2>&4) 2>&1); exec 3>&- 4>&-; echo \\"Runtime: $time_result\\"; echo \\"Exit Status: $?\\"; cat {input_file} | timeout --foreground {time_limit} /usr/bin/time -v {command} > /app/worker/output.txt; echo \\"Exit Status: $?\\""'
+        
+        # Run the combined command
+        combined_out = container.exec_run(combined_cmd, stdout=True, stderr=True).output.decode('utf-8')
+
+        # Parse output
+        lines = combined_out.split('\n')
+        print('lines', lines)
+        runtime = float(lines[0])
+        print('runtime', runtime)
+        memory = float(lines[12].split(":")[1].strip()) / 1024
+        print('memory', memory)
+        exit_status1 = int(lines[-3].split(":")[1].strip())
+        print('exit_status1`', exit_status1)        
+        exit_status2 = int(lines[-2].split(":")[1].strip())
+        print('exit_status2`', exit_status2)
+
+        # Check the exit status and update the result queue
+        if exit_status1 == 124 or exit_status2 == 124:
+            result_queue.put(('Time limit exceeded', runtime, memory))
+        elif exit_status1 == 134 or exit_status2 == 124:
+            result_queue.put(('Memory limit exceeded', runtime, memory))
         else:
-            result_queue.put(output)
+            # Read the contents of output.txt
+            read_cmd = '/bin/bash -c "cat /app/worker/output.txt"'
+            output_txt = container.exec_run(read_cmd).output.decode('utf-8')
+            print("Output.txt:")
+            print(output_txt)
+
+            result_queue.put((output_txt, runtime, memory))
     except Exception as e:
         print(str(e))
-        result_queue.put(str(e))
+        result_queue.put((str(e), 0, 0))
 
 def execute_code(code, test_cases, language, memory_limit=None):
     memory_limit = memory_limit or DEFAULT_MEMORY_LIMIT_MB
     results = []
     compiled_code = None
     tle = False
+
+    print('Compiling code...')
+
     if language == 'python':
         compiled_code = compile(code, '<string>', 'exec')
     elif language in ['java', 'cpp']:
         compiled_code = compile_code(code, language)
+
+    print('Done compiling')
 
     print("Creating docker client...")
     client = docker.DockerClient(base_url='unix://var/run/docker.sock')
@@ -107,6 +136,8 @@ def execute_code(code, test_cases, language, memory_limit=None):
     print("Starting Docker container...")
     container.start()
 
+    test_case_start = time.time()
+
     for i, test_case in enumerate(test_cases):
         key = test_case['key']
         input_file = input_files[i]
@@ -116,12 +147,9 @@ def execute_code(code, test_cases, language, memory_limit=None):
             continue
         result_queue = multiprocessing.Queue()
         process = multiprocessing.Process(target=run_test_case, args=(input_file, compiled_code, language, result_queue, memory_limit, container, command))
-        start_time = time.time()
         process.start()
 
-        result = result_queue.get()
-            
-        execution_time = time.time() - start_time
+        result, runtime, memory = result_queue.get()
 
         result = result.replace('\r', '')
 
@@ -138,9 +166,12 @@ def execute_code(code, test_cases, language, memory_limit=None):
             tle = True  # Exit loop for remaining test cases
             break  # Exit loop for remaining test cases
         else:
-            results.append({'key': key, 'status': status, 'stdout': result, 'time': execution_time})
+            results.append({'key': key, 'status': status, 'stdout': result, 'time': runtime, 'memory': memory})
 
         os.remove(input_file)
+
+    test_case_time = time.time() - test_case_start
+    print('test_case_time', test_case_time)
 
     print("Removing container...")
     container.remove(force=True)
@@ -170,12 +201,11 @@ def compile_code(code, language):
             cpp_file.write(code.encode())
             cpp_file_name = cpp_file.name
         compile_result = subprocess.run(
-            ['g++', cpp_file_name, '-o', cpp_file_name[:-4]],
+            ['g++', '-O3', '-march=native', '-funroll-loops', cpp_file_name, '-o', cpp_file_name[:-4]],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         if compile_result.returncode != 0:
             return compile_result.stderr.decode()
-        # Adjust perms to ensure Docker container can access it
         os.chmod(cpp_file_name[:-4], 0o777)
         return cpp_file_name[:-4]
 

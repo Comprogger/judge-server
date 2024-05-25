@@ -36,13 +36,6 @@ def run_test_case(input_file, compiled_code, language, result_queue, memory_limi
         memory_limit_kb = memory_limit * 1024
 
         # Define the commands to be run
-        if language == 'python':
-            command = f'python {command}'
-        elif language == 'java':
-            command = f'java {command}'
-        elif language == 'cpp':
-            command = command
-
         combined_cmd = f'/bin/bash -c "ulimit -v {memory_limit_kb}; exec 3>&1 4>&2; TIMEFORMAT=\\"%3R\\"; time_result=$( (time (cat {input_file} | timeout --foreground {time_limit} {command} >\\&3) 2>&4) 2>&1); exec 3>&- 4>&-; echo \\"Runtime: $time_result\\"; echo \\"Exit Status: $?\\"; cat {input_file} | timeout --foreground {time_limit} /usr/bin/time -v {command} > /app/worker/output.txt; echo \\"Exit Status: $?\\""'
         
         # Run the combined command
@@ -86,7 +79,10 @@ def execute_code(code, test_cases, language, memory_limit=None):
     print('Compiling code...')
 
     if language == 'python':
-        compiled_code = compile(code, '<string>', 'exec')
+        with tempfile.NamedTemporaryFile(suffix=".py", dir="/app/worker/python", delete=False) as py_file:
+            py_file.write(code.encode())
+            compiled_code = py_file.name
+        os.chmod(compiled_code, 0o777)
     elif language in ['java', 'cpp']:
         compiled_code = compile_code(code, language)
 
@@ -97,7 +93,7 @@ def execute_code(code, test_cases, language, memory_limit=None):
     print("Client created")
 
     # Write all the input data to files in a folder
-    input_dir = "/app/worker/input_data"
+    input_dir = f"/app/worker/{language}/input_data"
     os.makedirs(input_dir, exist_ok=True)
     input_files = []
     for i, test_case in enumerate(test_cases):
@@ -107,19 +103,17 @@ def execute_code(code, test_cases, language, memory_limit=None):
             f.write(input_data)
         input_files.append(input_file)
 
-    # Build Docker image from Dockerfile in /app/worker
+    # Build Docker image from Dockerfile in /app/worker/{language}
     print("Building Docker image...")
-    client.images.build(path='/app/worker', tag='worker_image')
+    client.images.build(path=f'/app/worker/{language}', tag='worker_image')
+    image = 'worker_image'
 
     if language == 'python':
-        image = 'python:3.8'
-        command = 'python'
+        command = f'python {compiled_code}'
     elif language == 'java':
-        image = 'openjdk:11'
         temp_dir, class_name = compiled_code
         command = f'java -classpath {temp_dir} {class_name}'
     elif language == 'cpp':
-        image = 'worker_image'  # Use the built image
         command = f'{compiled_code}'
 
     # Create Docker container
@@ -176,9 +170,10 @@ def execute_code(code, test_cases, language, memory_limit=None):
     print("Removing container...")
     container.remove(force=True)
 
+    print("Deleting temporary files...")
+    os.remove(compiled_code)
+
     if language == 'cpp':
-        print("Deleting temporary C++ files...")
-        os.remove(compiled_code)
         os.remove(f'{compiled_code}.cpp')
 
     return results
@@ -186,7 +181,7 @@ def execute_code(code, test_cases, language, memory_limit=None):
 def compile_code(code, language):
     if language == 'java':
         class_name = re.search(r'class (\w+)', code).group(1)
-        with tempfile.TemporaryDirectory(dir="/app/worker") as temp_dir:
+        with tempfile.TemporaryDirectory(dir="/app/worker/java") as temp_dir:
             java_file_name = os.path.join(temp_dir, f"{class_name}.java")
             with open(java_file_name, 'w') as java_file:
                 java_file.write(code)
@@ -197,7 +192,7 @@ def compile_code(code, language):
                 return compile_result.stderr.decode()
             return temp_dir, class_name
     elif language == 'cpp':
-        with tempfile.NamedTemporaryFile(suffix=".cpp", dir="/app/worker", delete=False) as cpp_file:
+        with tempfile.NamedTemporaryFile(suffix=".cpp", dir="/app/worker/cpp", delete=False) as cpp_file:
             cpp_file.write(code.encode())
             cpp_file_name = cpp_file.name
         compile_result = subprocess.run(

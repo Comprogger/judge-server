@@ -1,8 +1,8 @@
 # Use an image with GCC installed
-FROM gcc:latest
+FROM python:3.8
 
 # Set the working directory in the container
-WORKDIR /app/worker
+WORKDIR /app/worker/python
 
 # Copy all files from the current directory to the workdir in the container
 COPY . .
